@@ -1,0 +1,7 @@
+# Optional: require reviews from specific teams per folder.
+# Replace the team names with your own and uncomment.
+#
+# /zones/      @your-org/dns-owners
+# /modules/    @your-org/platform-team
+# /root/       @your-org/platform-team
+# /.github/    @your-org/platform-team
