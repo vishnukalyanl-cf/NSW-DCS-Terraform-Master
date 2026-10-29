@@ -1,0 +1,372 @@
+# MOVE THIS FILE to .github/workflows/terraform.yml using the GitHub web editor
+# (GitHub blocks OAuth apps from creating workflow files). See the PR description.
+name: Terraform - Cloudflare
+
+on:
+  # Automatic, never changes Cloudflare:
+  #   - every branch: fmt + validate
+  #   - main only:  post-merge check that main matches Cloudflare
+  # (No paths filter, so the required "Format & validate" check always reports.)
+  push:
+    branches: ["**"]
+
+  # Manual: the user picks the zone and what to do
+  workflow_dispatch:
+    inputs:
+      zone:
+        description: "Zone file in zones/ without .tfvars (e.g. example-com)"
+        required: true
+        type: string
+      action:
+        description: "What to run"
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+          - drift-check
+          - state-list
+
+permissions:
+  contents: read
+
+# Manual runs: one run per zone at a time, across ALL branches (queued, never
+# cancelled mid-apply). Automatic runs: one per branch.
+concurrency:
+  group: terraform-${{ inputs.zone || github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.17.0"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  ZONE: ${{ inputs.zone }}
+  ACTION: ${{ inputs.action }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  AWS_ENDPOINT_URL_S3: https://${{ vars.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+
+jobs:
+  # ---------------------------------------------------------------------------
+  checks:
+    name: Format & validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform init (no backend)
+        working-directory: root
+        run: terraform init -backend=false -lockfile=readonly
+
+      - name: terraform validate
+        working-directory: root
+        run: terraform validate
+
+  # ---------------------------------------------------------------------------
+  plan:
+    name: ${{ inputs.action }} - ${{ inputs.zone }}
+    if: github.event_name == 'workflow_dispatch'
+    needs: checks
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    defaults:
+      run:
+        shell: bash
+        working-directory: root
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # full history: needed by the apply safety checks
+
+      - name: Check inputs
+        run: |
+          if [[ ! "$ZONE" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "::error::Zone '$ZONE' is not a valid file name"; exit 1
+          fi
+          if [[ ! -f "../zones/${ZONE}.tfvars" ]]; then
+            echo "::error::zones/${ZONE}.tfvars does not exist"; exit 1
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: |
+          terraform init -lockfile=readonly \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=zones/${ZONE}/terraform.tfstate"
+
+      - name: terraform validate
+        run: terraform validate
+
+      # Applies run from feature branches. These checks stop a branch from
+      # silently undoing changes that are already live in Cloudflare.
+      - name: Apply safety checks
+        if: inputs.action == 'apply'
+        run: |
+          # 1. The branch must contain everything already merged to main.
+          if ! git merge-base --is-ancestor origin/main HEAD; then
+            echo "::error::Branch '${GITHUB_REF_NAME}' is behind main. Merge main into it (git merge origin/main), push, then run again."
+            exit 1
+          fi
+
+          # 2. The branch must contain the last commit applied to this zone,
+          #    so an applied-but-unmerged branch is never overwritten.
+          MARKER="s3://${TF_STATE_BUCKET}/zones/${ZONE}/last-applied.txt"
+          if aws s3 cp "$MARKER" last-applied.txt --region auto --only-show-errors 2>/dev/null; then
+            LAST_SHA="$(sed -n 1p last-applied.txt)"
+            LAST_BRANCH="$(sed -n 2p last-applied.txt)"
+            echo "Last apply for ${ZONE}: ${LAST_SHA} from '${LAST_BRANCH}'"
+            if ! git merge-base --is-ancestor "$LAST_SHA" HEAD 2>/dev/null; then
+              if [[ "$GITHUB_REF_NAME" == "main" ]]; then
+                echo "::warning::Applying main will UNDO changes applied from '${LAST_BRANCH}' (${LAST_SHA:0:7}) that were never merged. Read the plan carefully."
+              else
+                echo "::error::The last apply to ${ZONE} came from '${LAST_BRANCH}' (${LAST_SHA:0:7}), which is not in this branch. Merge that branch to main (or roll it back), merge main into this branch, then run again."
+                exit 1
+              fi
+            fi
+          else
+            echo "No previous apply recorded for ${ZONE}."
+          fi
+
+      - name: terraform state list
+        if: inputs.action == 'state-list'
+        run: |
+          RESOURCES="$(terraform state list 2>/dev/null || true)"
+          echo "${RESOURCES:-(state is empty)}"
+          {
+            echo "### Resources in state for **${ZONE}**"
+            echo ""
+            echo "${RESOURCES:-(state is empty)}" | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: terraform plan
+        id: plan
+        if: inputs.action != 'state-list'
+        run: |
+          MODE=""
+          if [[ "$ACTION" == "drift-check" ]]; then MODE="-refresh-only"; fi
+
+          set +e
+          terraform plan $MODE -lock-timeout=5m \
+            -var-file="../zones/${ZONE}.tfvars" \
+            -out=tfplan -detailed-exitcode
+          CODE=$?
+          set -e
+
+          if [[ $CODE -eq 1 ]]; then exit 1; fi
+          if [[ $CODE -eq 2 ]]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ $CODE -eq 2 && "$ACTION" == "drift-check" ]]; then
+            echo "::warning::Drift detected: Cloudflare differs from Terraform state (changed outside Terraform)."
+          fi
+
+          terraform show -no-color tfplan > plan.txt
+          {
+            echo "### terraform ${ACTION}: **${ZONE}**"
+            echo ""
+            head -c 60000 plan.txt | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan for apply
+        if: inputs.action == 'apply' && steps.plan.outputs.has_changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: root/tfplan
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  apply:
+    name: apply - ${{ inputs.zone }}
+    needs: plan
+    if: >-
+      inputs.action == 'apply' &&
+      needs.plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    environment: production # waits here for reviewer approval
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: root
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: |
+          terraform init -lockfile=readonly \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=zones/${ZONE}/terraform.tfstate"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: root
+
+      - name: Back up current state to R2
+        env:
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          if terraform state pull > state-backup.json && [[ -s state-backup.json ]]; then
+            aws s3 cp state-backup.json \
+              "s3://${TF_STATE_BUCKET}/backups/${ZONE}/$(date -u +%Y%m%dT%H%M%SZ)-run${GITHUB_RUN_ID}.tfstate" \
+              --region auto
+          else
+            echo "No existing state yet - nothing to back up."
+          fi
+
+      - name: terraform apply
+        run: |
+          terraform apply -lock-timeout=5m tfplan 2>&1 | tee apply.log
+          {
+            echo "### Apply result: **${ZONE}**"
+            echo ""
+            tail -n 40 apply.log | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record last applied commit
+        env:
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          printf '%s\n%s\n%s\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > last-applied.txt
+          aws s3 cp last-applied.txt "s3://${TF_STATE_BUCKET}/zones/${ZONE}/last-applied.txt" --region auto --only-show-errors
+          {
+            echo ""
+            echo "Applied from branch **${GITHUB_REF_NAME}** (${GITHUB_SHA:0:7}). Next: verify, then open a pull request and merge it to main."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Post-merge check. After a merge to main, every changed zone (or every
+  # zone, if shared code changed) is planned. Expected result: "No changes",
+  # because the change was already applied from the feature branch.
+  changed-zones:
+    name: Find changed zones
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: checks
+    runs-on: ubuntu-latest
+    outputs:
+      zones: ${{ steps.find.outputs.zones }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: List zones to check
+        id: find
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "$BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            ALL=true
+          elif git diff --name-only "$BEFORE" "$GITHUB_SHA" | grep -qE '^(root|modules)/'; then
+            ALL=true
+          else
+            ALL=false
+          fi
+
+          if [[ "$ALL" == "true" ]]; then
+            ZONES="$(find zones -maxdepth 1 -name '*.tfvars' -exec basename {} .tfvars \;)"
+          else
+            ZONES="$(git diff --name-only "$BEFORE" "$GITHUB_SHA" -- 'zones/*.tfvars' | xargs -r -n1 basename -s .tfvars)"
+          fi
+
+          JSON="$(for z in $ZONES; do if [[ -f "zones/$z.tfvars" ]]; then echo "$z"; fi; done | jq -Rcs 'split("\n") | map(select(length > 0))')"
+          echo "Zones to check: $JSON"
+          echo "zones=$JSON" >> "$GITHUB_OUTPUT"
+
+  post-merge-check:
+    name: Post-merge check - ${{ matrix.zone }}
+    needs: changed-zones
+    if: needs.changed-zones.outputs.zones != '' && needs.changed-zones.outputs.zones != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        zone: ${{ fromJSON(needs.changed-zones.outputs.zones) }}
+    env:
+      ZONE: ${{ matrix.zone }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    defaults:
+      run:
+        shell: bash
+        working-directory: root
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: |
+          terraform init -lockfile=readonly \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=zones/${ZONE}/terraform.tfstate"
+
+      - name: Check main matches Cloudflare
+        run: |
+          set +e
+          terraform plan -lock=false -no-color -detailed-exitcode \
+            -var-file="../zones/${ZONE}.tfvars" > plan.txt 2>&1
+          CODE=$?
+          set -e
+          cat plan.txt
+
+          if [[ $CODE -eq 0 ]]; then
+            echo "### Post-merge check: **${ZONE}** - main matches Cloudflare" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "### Post-merge check FAILED: **${ZONE}**"
+            echo ""
+            head -c 60000 plan.txt | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ $CODE -eq 2 ]]; then
+            echo "::error::main does not match Cloudflare for ${ZONE}. Was something merged without being applied? See README > Troubleshooting."
+          fi
+          exit 1
+
+      # main is now the known-good baseline for this zone. This also keeps the
+      # apply safety checks working when PRs are squash- or rebase-merged.
+      - name: Mark main as last applied
+        run: |
+          printf '%s\n%s\n%s\n' "$GITHUB_SHA" "main" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > last-applied.txt
+          aws s3 cp last-applied.txt "s3://${TF_STATE_BUCKET}/zones/${ZONE}/last-applied.txt" --region auto --only-show-errors
