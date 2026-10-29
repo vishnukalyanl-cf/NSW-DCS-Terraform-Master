@@ -1,5 +1,4 @@
-# MOVE THIS FILE to .github/workflows/terraform.yml using the GitHub web editor
-# (GitHub blocks OAuth apps from creating workflow files). See the PR description.
+
 name: Terraform - Cloudflare
 
 on:
