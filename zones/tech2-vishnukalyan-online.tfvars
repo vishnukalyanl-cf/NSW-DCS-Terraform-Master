@@ -9,4 +9,11 @@ dns_records = {
     content = "20.88.188.200"
     proxied = true
   }
+
+  tf_test_b = {
+    name    = "tfftest"
+    type    = "A"
+    content = "20.88.188.200"
+    proxied = true
+  }
 }
